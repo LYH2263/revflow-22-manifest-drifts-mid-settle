@@ -20,6 +20,12 @@ def get_manifest(run_id: int):
     return svc.get_manifest_view(run_id)
 
 
+@router.get("/settle-runs/{run_id}/proof")
+def get_run_proof(run_id: int):
+    """只读：按归并运行 id 查询清单对照证明（固化/实际配平/漂移/隔离四组键）。"""
+    return svc.get_run_proof(run_id)
+
+
 @router.post("/settle-runs")
 def post_run(freeze_only: bool = Query(False, description="只固化本趟消费清单，不配平")):
     return svc.run_settle(freeze_only=freeze_only)

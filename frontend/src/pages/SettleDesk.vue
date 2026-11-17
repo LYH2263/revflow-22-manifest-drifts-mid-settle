@@ -96,18 +96,20 @@ function yuan(cents) {
 const reconciled = computed(() => {
   if (!detail.value) return false
   const s = detail.value.summary
-  return s.待归并集合数 === s.成功数 + s.隔离数 + s.未执行数 && s.未执行数 === 0
+  return s.清单成员数 === s.成功数 + s.隔离数 + s.未执行数 && s.未执行数 === 0
 })
+
+const proof = computed(() => detail.value?.proof || null)
 </script>
 
 <template>
   <div>
     <h1>归并台</h1>
     <p class="lead">
-      开跑后按当前待归并集合配平并落余额；新装载流水若已待归并可进入本趟。
+      开跑瞬间固化本趟候选冲正键集合，本趟只处理固化清单内成员；清单外新到达流水留待后续趟，不得进本趟正式配平。
     </p>
     <p class="note-strip">
-      清单持久在库（独立清单表挂归并运行 id + 成员行）；配平失败则清单标记失败、正式余额不变。
+      清单持久在库（独立清单表挂归并运行 id + 不可变成员行）；配平查询只读清单快照，提交前再校验实际触及键 ⊆ 固化清单，越界整趟回滚；失败则清单标记失败、正式余额不变。每趟另出一份清单对照证明（固化键/实际配平键/漂移键/隔离键）。
     </p>
     <div class="row-actions">
       <button class="btn" :disabled="busy" @click="runSettle">跑净额归并</button>
@@ -225,6 +227,74 @@ const reconciled = computed(() => {
             <tr v-if="!detail.exclusions.length"><td colspan="5">本趟无清单外新到达</td></tr>
           </tbody>
         </table>
+
+        <h2 style="margin-top: 22px">
+          清单对照证明 · 归并 #{{ detailId }}
+          <span v-if="proof" class="tag" :class="{ on: proof.status === '已配平', bad: proof.status === '失败' }">
+            {{ proof.status }}
+          </span>
+        </h2>
+        <p v-if="!proof" class="note-strip">清单已固化尚未配平，配平或失败闭后在此生成对照证明（与清单、流水、隔离同库同源）。</p>
+        <template v-else>
+          <div class="stats">
+            <div class="stat">
+              <div class="k">固化键</div>
+              <div class="v">{{ proof.frozen_count }}</div>
+            </div>
+            <div class="stat">
+              <div class="k">实际配平键</div>
+              <div class="v">{{ proof.settled_count }}</div>
+            </div>
+            <div class="stat">
+              <div class="k">漂移键（清单外）</div>
+              <div class="v">{{ proof.drift_count }}</div>
+            </div>
+            <div class="stat">
+              <div class="k">隔离键</div>
+              <div class="v">{{ proof.quarantine_count }}</div>
+            </div>
+            <div class="stat">
+              <div class="k">收口结论</div>
+              <div class="v">
+                <span class="tag" :class="proof.containment_ok ? 'on' : 'bad'">
+                  {{ proof.containment_ok ? '实际触及键 ⊆ 固化清单' : '越界失败' }}
+                </span>
+              </div>
+            </div>
+          </div>
+          <p v-if="proof.failure_reason" class="msg">失败原因：{{ proof.failure_reason }}</p>
+          <p class="note-strip" :class="{ msg: !proof.containment_ok }">
+            配平/隔离键全部来自固化键集合，漂移键不计入本趟正式余额；证明一经写入不可改、不可删，
+            可经只读接口 <code>GET /api/settle-runs/{{ detailId }}/proof</code> 按归并运行 id 调取。
+          </p>
+          <table>
+            <thead>
+              <tr><th>对照项</th><th>笔数</th><th>流水键清单</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>固化键（开跑瞬间钉扎）</td>
+                <td>{{ proof.frozen_count }}</td>
+                <td class="keys">{{ proof.frozen_keys.join('、') || '—' }}</td>
+              </tr>
+              <tr>
+                <td>实际配平键（进正式余额）</td>
+                <td>{{ proof.settled_count }}</td>
+                <td class="keys">{{ proof.settled_keys.join('、') || '—' }}</td>
+              </tr>
+              <tr>
+                <td>漂移键（清单外，留待后续趟）</td>
+                <td>{{ proof.drift_count }}</td>
+                <td class="keys">{{ proof.drift_keys.join('、') || '—' }}</td>
+              </tr>
+              <tr>
+                <td>隔离键（未平/超额）</td>
+                <td>{{ proof.quarantine_count }}</td>
+                <td class="keys">{{ proof.quarantine_keys.join('、') || '—' }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </template>
       </template>
     </div>
   </div>
@@ -247,5 +317,11 @@ const reconciled = computed(() => {
   font-style: normal;
   font-size: 11px;
   color: var(--muted);
+}
+.keys {
+  font-family: var(--mono, monospace);
+  font-size: 12px;
+  word-break: break-all;
+  max-width: 640px;
 }
 </style>

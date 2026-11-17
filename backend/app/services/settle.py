@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 
 from app.db import connect, rows_to_dicts, transaction
-from app.modules import fail_closed_settle, settle_manifest as manifest
+from app.modules import fail_closed_settle, manifest_proof, settle_manifest as manifest
 
 
 def _now() -> str:
@@ -220,7 +220,23 @@ def get_manifest_view(run_id: int) -> dict:
             except manifest.ManifestNotFound:
                 raise HTTPException(404, "该归并运行无消费清单") from None
             view["run"] = dict(run)
+            try:
+                view["proof"] = manifest_proof.get_proof(conn, run_id)
+            except manifest_proof.ProofNotFound:
+                view["proof"] = None
             return view
+
+
+def get_run_proof(run_id: int) -> dict:
+    """只读接口：按归并运行 id 查询清单对照证明（固化/实际配平/漂移/隔离四组键）。"""
+    with connect() as conn:
+        run = conn.execute("SELECT id FROM settle_runs WHERE id = ?", (run_id,)).fetchone()
+        if not run:
+            raise HTTPException(404, "归并运行不存在")
+        try:
+            return manifest_proof.get_proof(conn, run_id)
+        except manifest_proof.ProofNotFound:
+            raise HTTPException(404, f"归并运行 #{run_id} 尚无清单对照证明") from None
 
 
 def run_verify(settle_run_id: int | None = None) -> dict:
@@ -328,8 +344,32 @@ def run_verify(settle_run_id: int | None = None) -> dict:
                 and member_net == head["net_cents"]
                 and ledger_net == head["net_cents"]
             )
+
+            # 清单对照证明同源核对：证明的固化键=清单成员、实际配平键=已归并流水、
+            # 漂移键=清单外到达、隔离键=隔离成员；收口结论必须为通过。
+            proof = None
+            proof_consistent = False
+            try:
+                proof = manifest_proof.get_proof(conn, settle_run_id)
+                proof_consistent = (
+                    proof["status"] == manifest_proof.PROOF_BALANCED
+                    and proof["containment_ok"] == 1
+                    and set(proof["frozen_keys"]) == {m["entry_key"] for m in members}
+                    and set(proof["settled_keys"])
+                    == {m["entry_key"] for m in settled_rows}
+                    and set(proof["drift_keys"])
+                    == {x["entry_key"] for x in exclusions}
+                    and set(proof["quarantine_keys"])
+                    == {m["entry_key"] for m in quarantined_rows}
+                    and not (
+                        set(proof["settled_keys"]) | set(proof["quarantine_keys"])
+                    ) - set(proof["frozen_keys"])
+                )
+            except manifest_proof.ProofNotFound:
+                proof_consistent = False
+
             balance_consistent = all_bal == all_ledger_net
-            consistent = 1 if (manifest_consistent and balance_consistent) else 0
+            consistent = 1 if (manifest_consistent and balance_consistent and proof_consistent) else 0
             detail = {
                 "清单成员数": len(members),
                 "成功数": len(settled_rows),
@@ -348,10 +388,19 @@ def run_verify(settle_run_id: int | None = None) -> dict:
                 "清单头计数一致": header_counts_match,
                 "清单对账一致": manifest_consistent,
                 "余额互证一致": balance_consistent,
+                "清单对照证明一致": proof_consistent,
                 "成员结果与流水不一致键": mismatched,
                 "未执行成员键": [m["entry_key"] for m in unexecuted_rows],
                 "清单外新到达键": [x["entry_key"] for x in exclusions],
                 "隔离成员键": [m["entry_key"] for m in quarantined_rows],
+                "对照证明": {
+                    "状态": proof["status"] if proof else None,
+                    "固化键": proof["frozen_keys"] if proof else [],
+                    "实际配平键": proof["settled_keys"] if proof else [],
+                    "漂移键": proof["drift_keys"] if proof else [],
+                    "隔离键": proof["quarantine_keys"] if proof else [],
+                    "收口通过": bool(proof and proof["containment_ok"] == 1),
+                },
             }
             now = _now()
             cur = conn.execute(

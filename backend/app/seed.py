@@ -94,6 +94,23 @@ CREATE TABLE IF NOT EXISTS settle_manifest_exclusions (
   UNIQUE(settle_run_id, entry_id)
 );
 CREATE INDEX IF NOT EXISTS idx_manifest_exclusions_run ON settle_manifest_exclusions(settle_run_id);
+CREATE TABLE IF NOT EXISTS settle_manifest_proofs (
+  id INTEGER PRIMARY KEY,
+  settle_run_id INTEGER NOT NULL UNIQUE REFERENCES settle_runs(id),
+  status TEXT NOT NULL,
+  frozen_keys_json TEXT NOT NULL,
+  settled_keys_json TEXT NOT NULL,
+  drift_keys_json TEXT NOT NULL,
+  quarantine_keys_json TEXT NOT NULL,
+  frozen_count INTEGER NOT NULL DEFAULT 0,
+  settled_count INTEGER NOT NULL DEFAULT 0,
+  drift_count INTEGER NOT NULL DEFAULT 0,
+  quarantine_count INTEGER NOT NULL DEFAULT 0,
+  containment_ok INTEGER NOT NULL DEFAULT 0,
+  failure_reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_manifest_proofs_run ON settle_manifest_proofs(settle_run_id);
 CREATE TABLE IF NOT EXISTS verify_reports (
   id INTEGER PRIMARY KEY,
   settle_run_id INTEGER REFERENCES settle_runs(id),
@@ -129,6 +146,20 @@ BEGIN
 END;
 """
 
+# 清单对照证明一经写入即归档证据：四组键集合与收口结论不可改、不可删。
+PROOF_IMMUTABLE_TRIGGERS = """
+CREATE TRIGGER IF NOT EXISTS trg_manifest_proofs_no_update
+BEFORE UPDATE ON settle_manifest_proofs
+BEGIN
+  SELECT RAISE(ABORT, '清单对照证明不可变');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_manifest_proofs_no_delete
+BEFORE DELETE ON settle_manifest_proofs
+BEGIN
+  SELECT RAISE(ABORT, '清单对照证明不可删');
+END;
+"""
+
 # 旧库补列（ALTER TABLE 无 IF NOT EXISTS，用 PRAGMA 守卫）。
 MIGRATED_COLUMNS = {
     "settle_runs": [
@@ -159,6 +190,7 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         _migrate_schema(conn)
         conn.executescript(MANIFEST_IMMUTABLE_TRIGGERS)
+        conn.executescript(PROOF_IMMUTABLE_TRIGGERS)
         n = conn.execute("SELECT COUNT(*) AS c FROM accounts").fetchone()["c"]
         if n:
             return

@@ -1,13 +1,27 @@
-"""归并整单失败闭：只消费清单成员，任一完整性校验失败则整趟回滚。
+"""归并整单失败闭：只消费固化清单成员，任一完整性/收口校验失败则整趟回滚。
 
-`balance_run` 必须在调用方的 `BEGIN IMMEDIATE` 事务内执行，且只读
-`settle_manifest_items` 的快照金额；正式余额与流水状态同事务提交。
+清单固化（路径 A：开跑 BEGIN 时冻结清单）
+-----------------------------------------
+`freeze_manifest` 在调用方的 `BEGIN IMMEDIATE` 事务内把开跑瞬间的待归并候选
+键集合钉死为 ``settle_manifest_items`` 成员行。本模块配平时**只读这张清单
+快照表**取候选，不再回查 ``ledger_entries`` 的待归并集合——因此配平期间装载
+线程新写入的清单外流水对本趟不可见，不可能被悄悄配平进正式余额。
+
+漂移收口（提交前子集校验，路径 B，作为路径 A 的纵深防线）
+----------------------------------------------------------
+即便快照读取被未来改动绕过，提交前仍强制校验「本趟实际触及键 ⊆ 固化清单」：
+- 置为已归并/已隔离的流水键必须全部是清单成员；
+- 本趟写入的隔离项、触及余额的账户所对应流水也必须落在清单内。
+任一越界即抛 `ContainmentViolation`，由调用方整趟 ROLLBACK，本趟余额/状态
+全部回滚，清单与运行标记失败并出失败证明。清单外的待归并键只登记为漂移键
+（``settle_manifest_exclusions`` + 对照证明），保持待归并留待后续趟。
 """
 
 from __future__ import annotations
 
 import sqlite3
 
+from app.modules import manifest_proof
 from app.modules.settle_manifest import (
     MANIFEST_BALANCED,
     MANIFEST_FAILED,
@@ -28,7 +42,12 @@ class ManifestIntegrityError(Exception):
     """清单成员与库内流水不一致（被改动/状态漂移）。"""
 
 
+class ContainmentViolation(Exception):
+    """实际触及键超出固化清单集合（候选漂移收口失败），整趟必须回滚。"""
+
+
 def _integrity_check(conn: sqlite3.Connection, run_id: int) -> list[dict]:
+    """逐条核对清单快照与库内流水：键/方向/账户/金额/原单不可变，状态须仍待归并。"""
     members = [
         dict(r)
         for r in conn.execute(
@@ -112,26 +131,99 @@ def _quarantine(conn: sqlite3.Connection, run_id: int, member: dict, reason: str
     _apply_status(conn, run_id, member, QUARANTINED, reason)
 
 
-def balance_run(conn: sqlite3.Connection, run_id: int, recorded_at: str | None = None) -> dict:
-    """按固化清单配平：只动清单成员，余额按净额增量写。"""
-    manifest = get_manifest(conn, run_id)
-
-    pending = [
-        dict(r)
+def _containment_check(
+    conn: sqlite3.Connection, run_id: int, member_ids: set[int], member_keys: set[str]
+) -> None:
+    """路径 B 收口：本趟实际触及的流水键必须 ⊆ 固化清单，否则整趟失败回滚。"""
+    outside_ledgers = [
+        r["entry_key"]
         for r in conn.execute(
-            "SELECT id, entry_key, account_id, kind, amount_cents, biz_ref, "
-            "target_entry_key, booked_at FROM ledger_entries "
-            "WHERE status = '待归并' AND kind IN ('正向', '冲正') ORDER BY id"
+            """
+            SELECT e.entry_key FROM ledger_entries e
+            WHERE e.settle_run_id = ?
+              AND e.id NOT IN (SELECT entry_id FROM settle_manifest_items WHERE settle_run_id = ?)
+            """,
+            (run_id, run_id),
         ).fetchall()
     ]
-    members = pending
+    if outside_ledgers:
+        raise ContainmentViolation(
+            "本趟触及清单外流水键，收口失败：" + "、".join(outside_ledgers)
+        )
+    outside_quarantine = [
+        r["entry_key"]
+        for r in conn.execute(
+            """
+            SELECT entry_key FROM quarantine_items
+            WHERE settle_run_id = ?
+              AND entry_key NOT IN (
+                SELECT entry_key FROM settle_manifest_items WHERE settle_run_id = ?
+              )
+            """,
+            (run_id, run_id),
+        ).fetchall()
+    ]
+    if outside_quarantine:
+        raise ContainmentViolation(
+            "本趟隔离项含清单外键，收口失败：" + "、".join(outside_quarantine)
+        )
+    # 被本趟标记结果的成员必须与固化成员一一对应，无遗漏、无越界。
+    touched_ids = {
+        r["id"]
+        for r in conn.execute(
+            """
+            SELECT e.id FROM ledger_entries e
+            WHERE e.settle_run_id = ? AND e.id IN (
+              SELECT entry_id FROM settle_manifest_items WHERE settle_run_id = ?
+            )
+            """,
+            (run_id, run_id),
+        ).fetchall()
+    }
+    if touched_ids != member_ids:
+        missing = member_keys - {
+            r["entry_key"]
+            for r in conn.execute(
+                """
+                SELECT m.entry_key FROM settle_manifest_items m
+                JOIN ledger_entries e ON e.id = m.entry_id
+                WHERE m.settle_run_id = ? AND e.settle_run_id = ?
+                """,
+                (run_id, run_id),
+            ).fetchall()
+        }
+        raise ContainmentViolation(
+            "本趟实际触及成员与固化清单不一致，未收口键：" + "、".join(sorted(missing))
+        )
+
+
+def balance_run(conn: sqlite3.Connection, run_id: int, recorded_at: str | None = None) -> dict:
+    """按固化清单配平（路径 A）：候选只从清单快照读取，余额按净额增量写。
+
+    全程在调用方 ``BEGIN IMMEDIATE`` 事务内；任何异常都由调用方闭并回滚，
+    正式余额与流水状态不会留下半截写入。
+    """
+    head = get_manifest(conn, run_id)
+    if head["status"] != MANIFEST_FROZEN:
+        raise ManifestIntegrityError(
+            f"归并运行 #{run_id} 清单状态为「{head['status']}」，仅「{MANIFEST_FROZEN}」可配平"
+        )
+
+    # 1) 完整性：清单快照逐字段比对库内流水，拒绝固化后被改动/抢跑的成员。
+    members = _integrity_check(conn, run_id)
+
+    # 2) 漂移登记先于成员状态变更：此刻仍待归并且不在清单内的键即清单外到达，
+    #    只登记、保持待归并，绝不进入本趟配平。
+    record_exclusions(conn, run_id)
+
+    # 3) 候选集合只取自固化清单快照（路径 A 的核心：不回查 ledger_entries 待归并集）。
     forwards = {m["entry_key"]: m for m in members if m["kind"] == "正向"}
     reversals = [m for m in members if m["kind"] == "冲正"]
 
-
-
     account_net: dict[int, int] = {}
     used: dict[str, int] = {key: 0 for key in forwards}
+    settled_keys: list[str] = []
+    quarantine_keys: list[str] = []
     settled_count = 0
     quarantine_count = 0
 
@@ -144,6 +236,7 @@ def balance_run(conn: sqlite3.Connection, run_id: int, recorded_at: str | None =
         if not target_key:
             _quarantine(conn, run_id, m, "冲正无原单")
             quarantine_count += 1
+            quarantine_keys.append(m["entry_key"])
             continue
         target = forwards.get(target_key)
         if target is None:
@@ -153,24 +246,29 @@ def balance_run(conn: sqlite3.Connection, run_id: int, recorded_at: str | None =
             reason = "原单不在本清单" if in_ledger else "冲正无原单"
             _quarantine(conn, run_id, m, reason)
             quarantine_count += 1
+            quarantine_keys.append(m["entry_key"])
             continue
         if target["account_id"] != m["account_id"]:
             _quarantine(conn, run_id, m, "冲正账户与原单不一致")
             quarantine_count += 1
+            quarantine_keys.append(m["entry_key"])
             continue
         if m["amount_cents"] > target["amount_cents"] - used[target_key]:
             _quarantine(conn, run_id, m, "冲正超额")
             quarantine_count += 1
+            quarantine_keys.append(m["entry_key"])
             continue
 
         used[target_key] += m["amount_cents"]
         account_net[m["account_id"]] = account_net.get(m["account_id"], 0) - m["amount_cents"]
         _apply_status(conn, run_id, m, SETTLED, "冲正配平")
         settled_count += 1
+        settled_keys.append(m["entry_key"])
 
     for key, m in forwards.items():
         _apply_status(conn, run_id, m, SETTLED, "正向落账")
         settled_count += 1
+        settled_keys.append(key)
 
     net_total = 0
     for account_id, net in account_net.items():
@@ -184,10 +282,17 @@ def balance_run(conn: sqlite3.Connection, run_id: int, recorded_at: str | None =
         )
         net_total += net
 
-    outside_count = conn.execute(
-        "SELECT COUNT(*) AS c FROM settle_manifest_exclusions WHERE settle_run_id = ?",
+    # 4) 路径 B 收口：提交前校验实际触及键 ⊆ 固化清单，越界即抛错整趟回滚。
+    member_ids = {m["entry_id"] for m in members}
+    member_keys = {m["entry_key"] for m in members}
+    _containment_check(conn, run_id, member_ids, member_keys)
+
+    drift_rows = conn.execute(
+        "SELECT entry_key FROM settle_manifest_exclusions WHERE settle_run_id = ? ORDER BY id",
         (run_id,),
-    ).fetchone()["c"]
+    ).fetchall()
+    drift_keys = [r["entry_key"] for r in drift_rows]
+    outside_count = len(drift_keys)
 
     finished = recorded_at or now_iso()
     conn.execute(
@@ -216,6 +321,18 @@ def balance_run(conn: sqlite3.Connection, run_id: int, recorded_at: str | None =
             run_id,
         ),
     )
+
+    # 5) 清单对照证明与本趟余额/状态同事务落库，四组键集合与清单、流水、隔离同源。
+    manifest_proof.write_proof(
+        conn,
+        run_id,
+        status=manifest_proof.PROOF_BALANCED,
+        frozen_keys=[m["entry_key"] for m in members],
+        settled_keys=settled_keys,
+        drift_keys=drift_keys,
+        quarantine_keys=quarantine_keys,
+        containment_ok=True,
+    )
     return {
         "settled_count": settled_count,
         "quarantine_count": quarantine_count,
@@ -225,7 +342,7 @@ def balance_run(conn: sqlite3.Connection, run_id: int, recorded_at: str | None =
 
 
 def mark_failed(conn: sqlite3.Connection, run_id: int, reason: str) -> None:
-    """失败闭：清单与运行标记失败；余额与流水保持原样。"""
+    """失败闭：清单与运行标记失败；余额与流水保持原样，并出失败对照证明。"""
     text = reason[:500]
     conn.execute(
         """
@@ -242,3 +359,5 @@ def mark_failed(conn: sqlite3.Connection, run_id: int, reason: str) -> None:
         """,
         (MANIFEST_FAILED, text, now_iso(), run_id),
     )
+    # 失败证明：实际配平/隔离键为空（配平事务已回滚），漂移键照当刻库态固化。
+    manifest_proof.failure_proof(conn, run_id, text)
